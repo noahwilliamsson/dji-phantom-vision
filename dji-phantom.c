@@ -115,22 +115,6 @@
  *   0x9000 - sent by server when compass calibration has started
  */
 
-/**
- * Battery millivolt notes
- * 12561         == 99%
- * 12522         == 98%
- * 12383         == 93%
- * 11505 - 11510 == 53%
- * 11499 - 11500 == 52%
- * 11455 - 11468 == 51%
- * 11445 - 11450 == 50%
- * 11430 - 11440 == 49%
- * 11163         == 15%
- * 11128         == 11%
- * 11105         ==  9%
- * 11085         ==  9%
- */
-
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -175,8 +159,9 @@ struct pkt {
 	/**
 	 * Most requests by the client has a zero least significant byte.
 	 * There are exceptions to this, however, such as the 24XX or 32XX
-	 * commands sent by the client.  Or the 0x0201 and 0x0201 commands
-	 * sent to enable/disable video recording.
+	 * commands sent by the client.  Or the 0x20 and 0x02 commands
+	 * sent to set camera time and enable/disable video recording,
+	 * respectively.
 	 *
 	 * During error conditions, the server may send responses with the
 	 * first payload byte set to 0xe_,  with the lower bits appearing
@@ -238,7 +223,7 @@ static void dump_packet(const struct pkt *pkt) {
 	fflush(stdout);
 }
 
-/* Response to command 0x0101 (take picture) on port 0x08 */
+/* Response to command 0x01 (take picture) on port 0x08 */
 static int handle_packet_0x01(const struct pkt *pkt) {
 	int n;
 
@@ -262,7 +247,7 @@ static int handle_packet_0x01(const struct pkt *pkt) {
 	return 0;
 }
 
-/* Response to command 0x0201 (start/stop recording) on port 0x08 */
+/* Response to command 0x02 (start/stop recording) on port 0x08 */
 static int handle_packet_0x02(const struct pkt *pkt) {
 	int n;
 
@@ -286,7 +271,7 @@ static int handle_packet_0x02(const struct pkt *pkt) {
 	return 0;
 }
 
-/* Response to command 0x2014 (unknown) on port 0x08 */
+/* Handle command 0x20 (set/ack camera time) on port 0x08 */
 static int handle_packet_0x20(const struct pkt *pkt) {
 	int n;
 
@@ -316,7 +301,7 @@ static int handle_packet_0x20(const struct pkt *pkt) {
 	return 0;
 }
 
-/* Response to command 0x2d00 (unknown) on port 0x08 */
+/* Response to command 0x2d (unknown) on port 0x08 */
 static int handle_packet_0x2d(const struct pkt *pkt) {
 	int n;
 
@@ -482,7 +467,7 @@ static int handle_packet_0x52(const struct pkt *pkt) {
 }
 
 /**
- * Response to command 0x53 on port 0x0a - battery/power related?
+ * Response to command 0x53 (power status) on port 0x0a
  * The millivolt reading is generally slightly above the one seen in
  * response to command 0x49 (GPS/telemetry).
  */
@@ -523,22 +508,16 @@ static int handle_packet_0x53(const struct pkt *pkt) {
 	return 0;
 }
 
-/* { 15,2,0,1, 0,18,48,9, 9,1,6,18, 13,5,7,144 } */
-static uint32_t key32[] = { 16777743, 154145280, 302383369, 2416379149 };
+static uint32_t gs_key[] = { 0x0100020f, 0x09301200, 0x12060109, 0x9007050d };
 
 #define DELTA 0x9e3779b9
 #define MX (((z>>5^y<<2) + (y>>3^z<<4)) ^ ((sum^y) + (key[(p&3)^e] ^ z)))
 
+/* Modified Corrected Block TEA (XXTEA) */
 void btea(uint32_t *v, int n, uint32_t const key[4]) {
 	uint32_t y, z, sum;
 	unsigned p, rounds, e;
 	if (n > 1) {          /* Coding Part */
-		// length1	== n
-		// num1		== rounds
-		// num3		== delta
-		// num4		== sum
-		// num5		== e
-		// num6		== p
 		rounds = 1 + 52/n;
 		sum = 0;
 		z = v[n-1];
@@ -569,7 +548,6 @@ void btea(uint32_t *v, int n, uint32_t const key[4]) {
 		} while ((sum -= DELTA) != 0);
 	}
 }
-
 
 static int gs_handle_set_waypoint_0x301(const struct pkt *pkt, const uint8_t *data, uint16_t len) {
 	struct {
@@ -678,7 +656,7 @@ static int gs_decrypt_packet(const struct pkt *pkt) {
 	printf("[0x%02x] GS: Decrypting %d dwords, %d (0x%02x) bytes of %d bytes encrypted payload\n",
 		pkt->cmd, blocks, blocks * 4, blocks * 4, len);
 
-	btea((uint32_t *)data, -blocks, key32);
+	btea((uint32_t *)data, -blocks, gs_key);
 	printf("[0x%02x] GS: Decrypted ", pkt->cmd);
 	for(int i = 0; i < blocks * 4; i++) printf("%02x", data[i]);
 	printf("  ");
@@ -686,6 +664,7 @@ static int gs_decrypt_packet(const struct pkt *pkt) {
 	printf(" (remaining)\n");
 
 #if 0
+	/* Old checksum tests.. perhaps CRC-16? */
 	p = temp;
 	memcpy(temp, pkt, 8);
 	memcpy(temp + 8, pkt->data, 2);
@@ -753,7 +732,6 @@ static int handle_packet_0x90(const struct pkt *pkt) {
 
 	return 0;
 }
-
 
 /* Handle errors */
 static int handle_packet_0xff(const struct pkt *pkt) {
@@ -928,20 +906,17 @@ static struct pkt *read_packet_from_hex_string(char *arg) {
 		pkt.seq = pkt.seq >> 8 | (pkt.seq & 0xff) << 8;
 	}
 	else {
-		pkt.port = 0x40;  /* Reply but port unknown */
+		pkt.port = 0x40;  /* Assume reply on unknown port */
 		if(arg[0] == '0') {
 			/**
 			 * Kludge to load %06u sequence numbers, i.e
 			 * ./dji-phantom -x 0123454900... to debug cmd 49
 			 */
-			if(sscanf(arg, "%06hu", &pkt.seq) == 1) {
+			if(sscanf(arg, "%06hu", &pkt.seq) == 1)
 				arg += 6;
-			}
-			else {
-				pkt.seq = 0;
-			}
 		}
 	}
+
 	sscanf(arg, "%02hhx", &pkt.cmd); arg += 2;
 	if(!pkt.len) pkt.len = 8 + strlen(arg) / 2;
 
@@ -952,7 +927,6 @@ static struct pkt *read_packet_from_hex_string(char *arg) {
 	return &pkt;
 }
 
-/* Note: command is given in big-endian order for better readability */
 static int send_packet(int fd, uint8_t port, uint8_t cmd, const uint8_t *data, uint8_t size) {
 	static uint16_t seq = 0;
 	uint8_t buf[255], i, len, n, *p = buf;
@@ -982,7 +956,6 @@ static int send_packet(int fd, uint8_t port, uint8_t cmd, const uint8_t *data, u
 
 	seq++;
 
-	/* Fix up endian-ness before printing it */
 	return filter_packet(&pkt);
 }
 
@@ -1164,14 +1137,14 @@ int main(int argc, char **argv) {
 		FD_SET(fileno(stdin), &rfds);
 		tv.tv_sec = 1;
 		tv.tv_usec = 500000;
-		ret = select(fd + 1, &rfds, NULL, NULL, &tv);
-		if(ret < 0) {
+		if((ret = select(fd + 1, &rfds, NULL, NULL, &tv)) < 0) {
 			fprintf(stderr, "ERROR: select() failed: %s\n",
 				strerror(errno));
 			close(fd);
 			return -1;
 		}
-		else if(ret == 0) {
+
+		if(ret == 0) {
 			/* Send something to prevent link from being closed */
 			if(send_packet(fd, 0x0a, 0x49, (uint8_t *)"", 1) < 0)
 				break;
